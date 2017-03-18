@@ -2,7 +2,7 @@ import cayenne.client
 from cayenne.client import CayenneMessage, TYPE_RELATIVE_HUMIDITY, UNIT_PERCENT
 import time
 
-from drivers.hts221 import Hts221
+#from drivers.hts221 import Hts221
 
 # Cayenne authentication info. This should be obtained from the Cayenne Dashboard.
 MQTT_CLIENT_ID = '31b6c4c0-facd-11e6-a722-0dd60d860c87'
@@ -32,13 +32,20 @@ channels = {
     'temperature': 1,
     'humidity': 2,
 }
-PERIOD_S = 60
+PERIOD_S = 10
+
+
+class SensorMock(object):
+    def read_temperature_and_humidity(self):
+        return 12, 23
+
 
 while True:
     client.loop()
 
     time.sleep(PERIOD_S)
-    sensor = Hts221()
+    #sensor = Hts221()
+    sensor = SensorMock()
     temperature, humidity = sensor.read_temperature_and_humidity()
     client.celsiusWrite(channels['temperature'], temperature)
     client.virtualWrite(channels['humidity'], humidity, TYPE_RELATIVE_HUMIDITY, UNIT_PERCENT)
