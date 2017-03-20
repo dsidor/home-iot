@@ -1,7 +1,7 @@
 import time
 import logging
 
-import BlynkLib
+from blynk.BlynkLib import BlynkConnection
 
 
 auth_token = '51faa2e21d694800a10672adc94861e7'
@@ -31,14 +31,16 @@ def write_slider(value, pin, state, blynk_ref):
 
 
 def main():
-    blynk = BlynkLib.Blynk(auth_token)
-
-    blynk.add_virtual_pin(0, read_temperature)
-    blynk.add_virtual_pin(1, read_humidity)
-    blynk.add_virtual_pin(2, write=write_slider)
-
-    blynk.virtual_write(2, 120)
+    blynk = BlynkConnection(auth_token)
     blynk.run()
+    # blynk = BlynkLib.Blynk(auth_token)
+    #
+    # blynk.add_virtual_pin(0, read_temperature)
+    # blynk.add_virtual_pin(1, read_humidity)
+    # blynk.add_virtual_pin(2, write=write_slider)
+    #
+    # blynk.virtual_write(2, 120)
+    # blynk.run()
 
 
 if __name__ == '__main__':
