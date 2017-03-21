@@ -151,20 +151,21 @@ class Pin(object):
 
 
 class VrPin(Pin):
-    def __init__(self, pin_no, read=None, write=None):
+    def __init__(self, pin_no, blynk_client, read=None, write=None):
         super(VrPin, self).__init__(pin_no)
         self._read = read
         self._write = write
+        self._blynk_client = blynk_client
 
     def read(self):
         if self._read is None:
-            return self._read()
+            return self._read(self._pin_no, self._blynk_client)
         else:
             raise IOError('Unable to read from VrPin {}.'.format(self._pin_no))
 
     def write(self, value):
         if self._read is None:
-            self._write(value)
+            self._write(value, self._pin_no, self._blynk_client)
         else:
             raise IOError('Unable to write to VrPin {}'.format(self._pin_no))
 
@@ -197,6 +198,14 @@ class HwPin(Pin):
         raise NotImplementedError()
 
 
+def nop(*args, **kwargs):
+    pass
+
+
+def not_implemented(*args, **kwargs):
+    raise NotImplementedError()
+
+
 class BlynkConnectionError(Exception):
     pass
 
@@ -207,6 +216,7 @@ class NoBlynkData(Exception):
 
 class BlynkConnection(object):
     def __init__(self, token, server='blynk-cloud.com', port=None, ssl=False):
+        self._last_tx_time = 0
         self._do_connect = True
         self._token = token
         self._server = server
@@ -219,15 +229,16 @@ class BlynkConnection(object):
         self._ssl = ssl
         self.state = DISCONNECTED
 
-        def nop():
-            pass
-
         self._on_connect = nop
         self._on_disconnect = nop
         self._last_hb_time = 0
         self._last_recv_time = 0
+        self._handle_hw_message = not_implemented
 
         self._clear_recv_data()
+
+    def set_handle_hw_message(self, func):
+        self._handle_hw_message = func
 
     def call_on_connect(self, func):
         self._on_connect = func
@@ -332,7 +343,7 @@ class BlynkConnection(object):
         msg_type = Msg(msg_type)
         log.debug('Received: msg_type: {}, msg_id: {}, msg_len: {}, msg_data: "{}"'.format(msg_type.name, msg_id,
                                                                                            msg_len, msg_data))
-        self._last_recv_time = int(time.time())
+        self._last_recv_time = time.time()
         return msg_type, msg_id, msg_len, msg_data
 
     def _handle_message(self, message):
@@ -345,8 +356,7 @@ class BlynkConnection(object):
             self._send_message(Msg.RSP, msg_id, STA_SUCCESS)
         elif msg_type == Msg.HW or msg_type == Msg.BRIDGE:
             if msg_data:
-                return
-                self._handle_hw(msg_data)
+                self._handle_hw_message(msg_data)
         else:
             raise BlynkConnectionError('Unsupported message type received: {}'.format(msg_type))
 
@@ -363,8 +373,15 @@ class BlynkConnection(object):
         packed = struct.pack(HDR_FMT, msg_type.value, msg_id, len(data)) + data
         self._send(packed)
 
+    def send_message(self, msg_type, *msg_datas):
+        self._send_message(msg_type, self._new_msg_id(), *msg_datas)
+
     def _send(self, data):
         retries = 0
+        tx_delay = self._last_tx_time + 1 / MAX_VIRTUAL_PINS - time.time()
+        if tx_delay > 0:
+            log.info('Sleeping before send for {}s'.format(tx_delay))
+            time.sleep(tx_delay)
         while retries <= MAX_TX_RETRIES:
             try:
                 self.conn.send(data)
@@ -375,23 +392,24 @@ class BlynkConnection(object):
                 else:
                     time.sleep(RE_TX_DELAY)
                     retries += 1
+        self._last_tx_time = time.time()
 
     def _server_alive(self):
-        now = int(time.time())
+        now = time.time()
         if now - self._last_recv_time > 2 * HB_PERIOD:
             return False
         else:
             return True
 
     def _heart_beat(self):
-        now = int(time.time())
+        now = time.time()
         if now - self._last_hb_time >= HB_PERIOD and self.state == AUTHENTICATED:
             self._send_message(Msg.PING, self._new_msg_id(), '')
             self._last_hb_time = now
 
     def run(self):
         self.state = DISCONNECTED
-        now = int(time.time())
+        now = time.time()
         self._last_hb_time = now
         self._last_recv_time = now
         self._msg_id = 1
@@ -426,278 +444,134 @@ class BlynkConnection(object):
 
 
 class BlynkClient(object):
-    def __init__(self):
+    def __init__(self, blynk_connection):
+        """
+        :param BlynkConnection blynk_connection:
+        """
+        self._blynk_conn = blynk_connection
         self._vr_pins = {}
         self._hw_pins = {}
 
-
-class Blynk(object):
-    def __init__(self, token, server='blynk-cloud.com', port=None, connect=True, kick_watchdog=None, ssl=False):
-        self._token = token
-        if isinstance(self._token, str):
-            self._token = bytes(token, 'ascii')
-        self._server = server
-        self._do_connect = connect
-        if kick_watchdog is None:
-            def nop():
-                pass
-
-            kick_watchdog = nop
-        self._kick_watchdog = kick_watchdog
-        if port is None:
-            if ssl:
-                port = 8441
-            else:
-                port = 8442
-        self._port = port
-        self._ssl = ssl
-
-        self._vr_pins = {}
-        self._hw_pins = {}
-        self.state = DISCONNECTED
-        self._on_connect = None
-
-    def _format_msg(self, msg_type, *args):
-        data = bytes('\0'.join(map(str, args)), 'ascii')
-        return struct.pack(HDR_FMT, msg_type, self._new_msg_id(), len(data)) + data
-
-    def _handle_hw(self, data):
-        params = list(map(lambda x: x.decode('ascii'), data.split(b'\0')))
-        cmd = params.pop(0)
-        if cmd == 'info':
-            pass
-        elif cmd == 'pm':
-            pairs = zip(params[0::2], params[1::2])
-            for (pin, mode) in pairs:
-                pin = int(pin)
-                if mode != 'in' and mode != 'out' and mode != 'pu' and mode != 'pd':
-                    raise ValueError("Unknown pin %d mode: %s" % (pin, mode))
-                self._hw_pins[pin] = HwPin(pin, mode, mode)
-            self._pins_configured = True
-        elif cmd == 'vw':
-            pin = int(params.pop(0))
-            if pin in self._vr_pins and self._vr_pins[pin].write:
-                for param in params:
-                    self._vr_pins[pin].write(param)
-            else:
-                print("Warning: Virtual write to unregistered pin %d" % pin)
-        elif cmd == 'vr':
-            pin = int(params.pop(0))
-            if pin in self._vr_pins and self._vr_pins[pin].read:
-                self._vr_pins[pin].read()
-            else:
-                print("Warning: Virtual read from unregistered pin %d" % pin)
-        elif self._pins_configured:
-            if cmd == 'dw':
-                pin = int(params.pop(0))
-                val = int(params.pop(0))
-                self._hw_pins[pin].digital_write(val)
-            elif cmd == 'aw':
-                pin = int(params.pop(0))
-                val = int(params.pop(0))
-                self._hw_pins[pin].analog_write(val)
-            elif cmd == 'dr':
-                pin = int(params.pop(0))
-                val = self._hw_pins[pin].digital_read()
-                self._send(self._format_msg(MSG_HW, 'dw', pin, val))
-            elif cmd == 'ar':
-                pin = int(params.pop(0))
-                val = self._hw_pins[pin].analog_read()
-                self._send(self._format_msg(MSG_HW, 'aw', pin, val))
-            else:
-                raise ValueError("Unknown message cmd: %s" % cmd)
-
-    def _new_msg_id(self):
-        self._msg_id += 1
-        if (self._msg_id > 0xFFFF):
-            self._msg_id = 1
-        return self._msg_id
-
-    def _settimeout(self, timeout):
-        if timeout != self._timeout:
-            self._timeout = timeout
-            self.conn.settimeout(timeout)
-
-    def _recv(self, length, timeout=0):
-        self._settimeout(timeout)
-        try:
-            self._rx_data += self.conn.recv(length)
-        except socket.timeout:
-            return b''
-        except socket.error as e:
-            if e.args[0] == EAGAIN:
-                return b''
-            else:
-                raise
-        if len(self._rx_data) >= length:
-            data = self._rx_data[:length]
-            self._rx_data = self._rx_data[length:]
-            return data
-        else:
-            return b''
-
-    def _send(self, data, send_anyway=False):
-        if self._tx_count < MAX_MSG_PER_SEC or send_anyway:
-            retries = 0
-            while retries <= MAX_TX_RETRIES:
-                try:
-                    self.conn.send(data)
-                    self._tx_count += 1
-                    break
-                except socket.error as er:
-                    if er.args[0] != EAGAIN:
-                        raise
-                    else:
-                        time.sleep_ms(RE_TX_DELAY)
-                        retries += 1
-
-    def _close(self, emsg=None):
-        self.conn.close()
-        self.state = DISCONNECTED
-        time.sleep(RECONNECT_DELAY)
-        if emsg:
-            print('Error: %s, connection closed' % emsg)
-
-    def _server_alive(self):
-        c_time = int(time.time())
-        if self._m_time != c_time:
-            self._m_time = c_time
-            self._tx_count = 0
-            if self._last_hb_id != 0 and c_time - self._hb_time >= MAX_SOCK_TO:
-                return False
-            if c_time - self._hb_time >= HB_PERIOD and self.state == AUTHENTICATED:
-                self._hb_time = c_time
-                self._last_hb_id = self._new_msg_id()
-                self._send(struct.pack(HDR_FMT, MSG_PING, self._last_hb_id, 0), True)
-        return True
-
-    def repl(self, pin):
-        repl = Terminal(self, pin)
-        self.add_virtual_pin(pin, repl.virtual_read, repl.virtual_write)
-        return repl
-
-    def notify(self, msg):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_NOTIFY, msg))
-
-    def tweet(self, msg):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_TWEET, msg))
-
-    def email(self, to, subject, body):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_EMAIL, to, subject, body))
-
-    def virtual_write(self, pin, val):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_HW, 'vw', pin, val))
-
-    def sync_all(self):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_HW_SYNC))
-
-    def sync_virtual(self, pin):
-        if self.state == AUTHENTICATED:
-            self._send(self._format_msg(MSG_HW_SYNC, 'vr', pin))
-
-    def add_virtual_pin(self, pin, read=None, write=None):
-        if isinstance(pin, int) and pin in range(0, MAX_VIRTUAL_PINS):
-            self._vr_pins[pin] = VrPin(read, write)
-        else:
-            raise ValueError('the pin must be an integer between 0 and %d' % (MAX_VIRTUAL_PINS - 1))
-
-    def call_on_connect(self, func):
-        self._on_connect = func
-
-    def set_user_tasks(self):
-        # TODO
-        raise NotImplementedError()
-
-    def connect(self):
-        self._do_connect = True
-
-    def disconnect(self):
-        self._do_connect = False
+        self._blynk_conn.set_handle_hw_message(self._handle_hw_message)
 
     def run(self):
-        self._start_time = time.ticks_ms()
-        self._hw_pins = {}
-        self._rx_data = b''
-        self._msg_id = 1
-        self._pins_configured = False
-        self._timeout = None
-        self._tx_count = 0
-        self._m_time = 0
-        self.state = DISCONNECTED
+        self._blynk_conn.run()
 
-        while True:
-            while self.state != AUTHENTICATED:
-                if self._do_connect:
-                    try:
-                        self.state = CONNECTING
-                        if self._ssl:
-                            import ssl
-                            print('SSL: Connecting to %s:%d' % (self._server, self._port))
-                            ss = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SEC)
-                            self.conn = ssl.wrap_socket(ss, cert_reqs=ssl.CERT_REQUIRED, ca_certs='/flash/cert/ca.pem')
-                        else:
-                            print('TCP: Connecting to %s:%d' % (self._server, self._port))
-                            self.conn = socket.socket()
-                        self.conn.connect(socket.getaddrinfo(self._server, self._port)[0][4])
-                    except:
-                        self._close('connection with the Blynk servers failed')
-                        continue
+    def add_virtual_pin(self, pin, read=None, write=None):
+        """
+        :param int pin:
+        :param read:
+        :param write:
+        :return:
+        """
+        if pin < 0 or pin > MAX_VIRTUAL_PINS:
+            raise ValueError('Virtual pin should be in range between {} and {}'.format(0, MAX_VIRTUAL_PINS - 1))
+        # TODO can I assert function prototype?
+        log.info('Registered {} virtual pin'.format(pin))
+        self._vr_pins[pin] = VrPin(pin, self, read, write)
 
-                    self.state = AUTHENTICATING
-                    hdr = struct.pack(HDR_FMT, MSG_LOGIN, self._new_msg_id(), len(self._token))  # dsidor
-                    print('Blynk connection successful, authenticating...')
-                    self._send(hdr + self._token, True)
-                    data = self._recv(HDR_LEN, timeout=MAX_SOCK_TO)
-                    if not data:
-                        self._close('Blynk authentication timed out')
-                        continue
+    def notify(self, msg):
+        self._blynk_conn.send_message(Msg.NOTIFY, msg)
 
-                    msg_type, msg_id, status = struct.unpack(HDR_FMT, data)
-                    if status != STA_SUCCESS or msg_id == 0:
-                        self._close('Blynk authentication failed')
-                        continue
+    def tweet(self, msg):
+        self._blynk_conn.send_message(Msg.NOTIFY, msg)
 
-                    self.state = AUTHENTICATED
-                    self._send(self._format_msg(MSG_HW_INFO, "h-beat", HB_PERIOD, 'dev', 'WiPy', "cpu", "CC3200"))
-                    print('Access granted, happy Blynking!')
-                    if self._on_connect:
-                        self._on_connect()
-                else:
-                    self._start_time = sleep_from_until(self._start_time, TASK_PERIOD_RES)
+    def email(self, to, subject, body):
+        self._blynk_conn.send_message(Msg.EMAIL, to, subject, body)
 
-            self._hb_time = 0
-            self._last_hb_id = 0
-            self._tx_count = 0
-            while self._do_connect:
-                data = self._recv(HDR_LEN, NON_BLK_SOCK)
-                if data:
-                    msg_type, msg_id, msg_len = struct.unpack(HDR_FMT, data)
-                    if msg_id == 0:
-                        self._close('invalid msg id %d' % msg_id)
-                        break
-                    if msg_type == MSG_RSP:
-                        if msg_id == self._last_hb_id:
-                            self._last_hb_id = 0
-                    elif msg_type == MSG_PING:
-                        self._send(struct.pack(HDR_FMT, MSG_RSP, msg_id, STA_SUCCESS), True)
-                    elif msg_type == MSG_HW or msg_type == MSG_BRIDGE:
-                        data = self._recv(msg_len, MIN_SOCK_TO)
-                        if data:
-                            self._handle_hw(data)
-                    else:
-                        self._close('unknown message type %d' % msg_type)
-                        break
-                else:
-                    self._start_time = sleep_from_until(self._start_time, IDLE_TIME_MS)
-                if not self._server_alive():
-                    self._close('Blynk server is offline')
-                    break
+    def virtual_write(self, pin, val):
+        self._blynk_conn.send_message(Msg.HW, 'vw', pin, val)
 
-            if not self._do_connect:
-                self._close()
-                print('Blynk disconnection requested by the user')
+    def sync_all(self):
+        # TODO what it does?
+        self._blynk_conn.send_message(Msg.HW_SYNC)
+
+    def sync_virtual(self, pin):
+        # TODO what it does?
+        self._blynk_conn.send_message(Msg.HW_SYNC, 'vr', pin)
+
+        # TODO get to know what it is
+        # def repl(self, pin):
+        #     repl = Terminal(self, pin)
+        #     self.add_virtual_pin(pin, repl.virtual_read, repl.virtual_write)
+        #     return repl
+
+    def _handle_hw_message(self, data):
+        params = list(map(lambda x: x.decode('ascii'), data.split(b'\0')))
+        cmd = params.pop(0)
+        commands = {
+            'info': self._handle_info,
+            'pm': self._handle_pin_mode,
+            'vr': self._handle_virtual_read,
+            'vw': self._handle_virtual_write,
+            'dr': self._handle_digital_read,
+            'dw': self._handle_digital_write,
+            'ar': self._handle_analog_read,
+            'aw': self._handle_analog_write,
+        }
+        if cmd in commands:
+            commands[cmd](params)
+        else:
+            log.error('Unsupported command {}'.format(cmd))
+
+    def _handle_info(self, params):
+        pass
+
+    def _handle_pin_mode(self, params):
+        # TODO to implement
+        log.error('Not implemented _handle_pin_mode, got params: {}'.format(params))
+        # pairs = zip(params[0::2], params[1::2])
+        # for (pin, mode) in pairs:
+        #     pin = int(pin)
+        #     if mode != 'in' and mode != 'out' and mode != 'pu' and mode != 'pd':
+        #         raise ValueError("Unknown pin %d mode: %s" % (pin, mode))
+        #     self._hw_pins[pin] = HwPin(pin, mode, mode)
+        # self._pins_configured = True
+
+    def _handle_virtual_read(self, params):
+        pin = int(params.pop(0))
+        if pin not in self._vr_pins:
+            log.warning('Virtual read of unregistered pin {}'.format(pin))
+        else:
+            self.virtual_write(pin, self._vr_pins[pin].read())
+
+    def _handle_virtual_write(self, params):
+        pin = int(params.pop(0))
+        if pin not in self._vr_pins:
+            log.warning('Virtual write to unregistered pin {}'.format(pin))
+        else:
+            # TODO should write in for or all list at once?
+            for param in params:
+                self._vr_pins[pin].write(param)
+
+    def _handle_digital_read(self, params):
+        pin = int(params.pop(0))
+        if pin in self._hw_pins:
+            val = self._hw_pins[pin].digital_read()
+            self._blynk_conn.send_message(Msg.HW, 'dw', pin, val)
+        else:
+            log.warning('Digital read of not configured pin {}'.format(pin))
+
+    def _handle_digital_write(self, params):
+        pin = int(params.pop(0))
+        val = int(params.pop(0))
+        if pin in self._hw_pins:
+            self._hw_pins[pin].digital_write(val)
+        else:
+            log.warning('Digital write to not configured pin {}'.format(pin))
+
+    def _handle_analog_read(self, params):
+        pin = int(params.pop(0))
+        if pin in self._hw_pins:
+            val = self._hw_pins[pin].analog_read()
+            self._blynk_conn.send_message(Msg.HW, 'aw', pin, val)
+        else:
+            log.warning('Digital write to not configured pin {}'.format(pin))
+
+    def _handle_analog_write(self, params):
+        pin = int(params.pop(0))
+        val = int(params.pop(0))
+        if pin in self._hw_pins:
+            self._hw_pins[pin].analog_write(val)
+        else:
+            log.warning('Analog write to not configured pin {}'.format(pin))
