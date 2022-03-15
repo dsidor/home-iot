@@ -1,0 +1,13 @@
+name: test action1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-20.04
+    steps:
+
+      - name: Install all deps
+        run: |
+          echo "cos leci"
