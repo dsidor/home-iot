@@ -17,4 +17,5 @@ jobs:
 
       - name: Install all deps
         run: |
-          echo "cos leci ${{ inputs.version }}"
+          echo "cos leci ${{ github.event.inputs.version }}"
+           
